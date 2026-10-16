@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Nixpkgs PR Branch Tracker
 // @namespace   UserScripts
-// @version     0.3.0
+// @version     0.3.1
 // @description Enhances GitHub PR pages by displaying merge commit hashes and tracking branch propagation for NixOS/nixpkgs.
 // @author      Bryan Lai <bryanlais@gmail.com>
 // @author      Leonard Sheng Sheng Lee <305414+sheeeng@users.noreply.github.com>
@@ -174,11 +174,19 @@
 
     // GitHub provides merge_commit_sha even for unmerged PRs. It is the test
     // merge commit, which is useful for testing the PR before it is merged.
-    // The value is null while GitHub computes mergeability.
+    // The value is null while GitHub computes mergeability, and also for a
+    // conflicted PR or a PR closed without merging.
     const commitHash = pullRequest.merge_commit_sha;
     if (!commitHash) {
-      status.textContent = "🔏 Waiting for GitHub to compute the merge commit…";
-      container.dataset.refreshAt = nextRefresh([], mergeCommitRetryDelay);
+      const computing =
+        pullRequest.state === "open" && pullRequest.mergeable === null;
+      status.textContent = computing
+        ? "🔏 Waiting for GitHub to compute the merge commit…"
+        : "🔏 No merge commit is available.";
+      container.dataset.refreshAt = nextRefresh(
+        [],
+        computing ? mergeCommitRetryDelay : refreshInterval,
+      );
       return;
     }
     status.remove();
