@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Nixpkgs PR Branch Tracker
 // @namespace   UserScripts
-// @version     0.2.1
+// @version     0.3.0
 // @description Enhances GitHub PR pages by displaying merge commit hashes and tracking branch propagation for NixOS/nixpkgs.
 // @author      Bryan Lai <bryanlais@gmail.com>
 // @author      Leonard Sheng Sheng Lee <305414+sheeeng@users.noreply.github.com>
@@ -53,6 +53,8 @@
   const headerSelector = '[class*="PageHeader-Description"], .gh-header-meta';
   const markerAttribute = "data-nixpkgs-branch-tracker";
   const tokenStorageKey = "github_api_token";
+  const refreshInterval = 5 * 60 * 1000;
+  const mergeCommitRetryDelay = 10 * 1000;
 
   GM_registerMenuCommand("Set GitHub token", () => {
     const token = prompt(
@@ -104,14 +106,16 @@
           const rateLimited =
             [403, 429].includes(response.status) &&
             /^x-ratelimit-remaining:\s*0\s*$/im.test(response.responseHeaders);
-          reject(
-            new Error(
-              rateLimited
-                ? `GitHub API rate limit reached until ${new Date(reset[1] * 1000).toLocaleTimeString()}. ` +
-                  'Set a token in the Tampermonkey menu: "Set GitHub token".'
-                : `HTTP ${response.status} for ${url}`,
-            ),
+          const error = new Error(
+            rateLimited
+              ? `GitHub API rate limit reached until ${new Date(reset[1] * 1000).toLocaleTimeString()}. ` +
+                'Set a token in the Tampermonkey menu: "Set GitHub token".'
+              : `HTTP ${response.status} for ${url}`,
           );
+          if (rateLimited) {
+            error.retryAt = reset[1] * 1000;
+          }
+          reject(error);
         },
         onerror: (response) =>
           reject(
@@ -131,12 +135,25 @@
     return link;
   };
 
+  /**
+   * Returns the time to render an incomplete result again. A rate-limit
+   * error delays the refresh until the limit resets.
+   */
+  const nextRefresh = (errors, delay = refreshInterval) =>
+    Math.max(Date.now() + delay, ...errors.map((error) => error.retryAt ?? 0));
+
+  /**
+   * Renders the tracker and stores in data-refresh-at when update() can
+   * render it again. Infinity marks a render in progress or a complete
+   * result that cannot change.
+   */
   const render = async (header, repository, pullRequestNumber) => {
     const container = document.createElement("div");
     container.setAttribute(
       markerAttribute,
       `${repository}#${pullRequestNumber}`,
     );
+    container.dataset.refreshAt = Infinity;
     container.className = "d-flex flex-wrap flex-items-center gap-2 mt-1";
     const status = document.createElement("span");
     status.className = "color-fg-muted";
@@ -151,16 +168,20 @@
       );
     } catch (error) {
       status.textContent = `⚠️ Nixpkgs PR Branch Tracker: ${error.message}`;
+      container.dataset.refreshAt = nextRefresh([error]);
       throw error;
     }
-    status.remove();
 
     // GitHub provides merge_commit_sha even for unmerged PRs. It is the test
     // merge commit, which is useful for testing the PR before it is merged.
+    // The value is null while GitHub computes mergeability.
     const commitHash = pullRequest.merge_commit_sha;
     if (!commitHash) {
+      status.textContent = "🔏 Waiting for GitHub to compute the merge commit…";
+      container.dataset.refreshAt = nextRefresh([], mergeCommitRetryDelay);
       return;
     }
+    status.remove();
 
     container.append(
       "🔏",
@@ -171,14 +192,19 @@
     );
 
     const branches = subscribedRepositories[repository];
-    if (!pullRequest.merged || !branches) {
+    if (!pullRequest.merged) {
+      // The test merge commit changes with new pushes, and the PR can merge.
+      container.dataset.refreshAt = nextRefresh([]);
+      return;
+    }
+    if (!branches) {
       return;
     }
 
     const compareLink = `https://github.com/${repository}/compare`;
     const compareApi = `https://api.github.com/repos/${repository}/compare/${commitHash}`;
 
-    for (const branch of branches) {
+    const results = branches.map((branch) => {
       const link = createLink(
         `${compareLink}/${commitHash}...${branch}`,
         branch,
@@ -202,20 +228,33 @@
               return merged;
             },
           );
-      status
-        .then((merged) => {
+      return status.then(
+        (merged) => {
           if (!merged) {
             // Reverse the comparison to show how far behind the branch is.
             link.href = `${compareLink}/${branch}...${commitHash}`;
           }
           link.prepend(merged ? "✅ " : "⚠️ ");
-        })
-        .catch((error) => {
+          return merged;
+        },
+        (error) => {
           link.prepend("❓ ");
           link.title = error.message;
           console.error(error);
-        });
-    }
+          throw error;
+        },
+      );
+    });
+
+    // Refresh until the commit is in every branch.
+    const settled = await Promise.allSettled(results);
+    const errors = settled
+      .filter(({ status }) => status === "rejected")
+      .map(({ reason }) => reason);
+    const complete = settled.every(
+      ({ status, value }) => status === "fulfilled" && value,
+    );
+    container.dataset.refreshAt = complete ? Infinity : nextRefresh(errors);
   };
 
   /**
@@ -230,12 +269,13 @@
     const repository = normalizeRepositoryName(match[1]);
     const pullRequestNumber = match[2];
     const header = document.querySelector(headerSelector);
-    if (
-      !header ||
-      header.querySelector(
-        `[${markerAttribute}="${repository}#${pullRequestNumber}"]`,
-      )
-    ) {
+    if (!header) {
+      return;
+    }
+    const existing = header.querySelector(
+      `[${markerAttribute}="${repository}#${pullRequestNumber}"]`,
+    );
+    if (existing && Number(existing.dataset.refreshAt) > Date.now()) {
       return;
     }
     header.querySelector(`[${markerAttribute}]`)?.remove();
