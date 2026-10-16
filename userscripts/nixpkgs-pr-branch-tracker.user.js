@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Nixpkgs PR Branch Tracker
 // @namespace   UserScripts
-// @version     0.2.0
+// @version     0.2.1
 // @description Enhances GitHub PR pages by displaying merge commit hashes and tracking branch propagation for NixOS/nixpkgs.
 // @author      Bryan Lai <bryanlais@gmail.com>
 // @author      Leonard Sheng Sheng Lee <305414+sheeeng@users.noreply.github.com>
@@ -57,12 +57,18 @@
   GM_registerMenuCommand("Set GitHub token", () => {
     const token = prompt(
       "Enter a GitHub Personal Access Token to avoid rate limits.\n" +
-        "Required scope: public_repo (read-only).\n" +
+        "Use a classic token with no scopes, or a fine-grained token with\n" +
+        "public repository read-only access. Do not grant write scopes.\n" +
         "Leave empty to remove the stored token.",
       GM_getValue(tokenStorageKey, ""),
     );
     if (token !== null) {
       GM_setValue(tokenStorageKey, token.trim());
+      // Remove failed or stale renders so update() retries with the new token.
+      document
+        .querySelectorAll(`[${markerAttribute}]`)
+        .forEach((element) => element.remove());
+      update();
     }
   });
 
